@@ -129,7 +129,11 @@ The scene is cleaned between files automatically. If memory is still an issue, r
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+**Free for personal use** — individuals, students, hobbyists welcome.
+
+**Commercial use requires permission** — if your company/studio wants to use this add-on in a production pipeline, please contact the author for a commercial license.
+
+See [LICENSE](LICENSE)
 
 ## Contributing
 

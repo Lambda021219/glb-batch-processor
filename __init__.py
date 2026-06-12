@@ -7,6 +7,10 @@
 # 安装：Blender → Edit → Preferences → Add-ons → Install → 选 zip
 # 位置：3D Viewport → Sidebar (N键) → "GLB处理" 标签页
 # 依赖：Quad Remesher 1.23+ | Blender 4.0+
+#
+# 许可：仅供个人学习与使用，商业用途请联系作者授权
+# License: Free for personal/educational use. Commercial use requires
+#          permission. Contact: Lambda021219
 # ================================================================
 # ################################################################
 
