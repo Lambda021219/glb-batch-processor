@@ -13,7 +13,7 @@
 bl_info = {
     "name": "GLB 自动化拓扑与烘焙工具 / GLB Auto-Retopo & Bake",
     "author": "GLB Batch Processor Contributors",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 0, 0),
     "location": "3D Viewport > Sidebar (N键) > GLB处理",
     "description": (
@@ -23,7 +23,7 @@ bl_info = {
         "Cycles GPU bake (Diffuse + Normal), export to GLB/FBX/OBJ/USD/STL"
     ),
     "doc_url": "https://github.com/Lambda021219/glb-batch-processor",
-    "tracker_url": "https://github.com/your-username/glb-batch-processor/issues",
+    "tracker_url": "https://github.com/Lambda021219/glb-batch-processor/issues",
     "category": "Object",
     "support": "COMMUNITY",
 }
@@ -132,21 +132,30 @@ class GLB_InputProperties(bpy.types.PropertyGroup):
 
 
 class GLB_RemeshProperties(bpy.types.PropertyGroup):
-    """Quad Remesher 重拓扑参数"""
+    """重拓扑参数"""
+    remesh_method: bpy.props.EnumProperty(
+        name="重拓扑方式 / Method",
+        items=[
+            ('NATIVE', "Blender 原生 Quadriflow（免费）", "Blender 内置 Quadriflow 算法，无需额外插件"),
+            ('QUADREMESHER', "Quad Remesher（需付费插件）", "需要安装并启用 Quad Remesher 1.23+"),
+        ],
+        default='NATIVE',
+        description="选择重拓扑算法。Quad Remesher 效果更好但需付费购买"
+    )  # type: ignore
     quad_count: bpy.props.IntProperty(
         name="目标面数 / Target Quads",
         default=5000, min=100, max=1000000,
-        description="Quad Remesher 重拓扑的目标四边形数量"
+        description="重拓扑的目标四边形数量"
     )  # type: ignore
     adapt_quad_count: bpy.props.BoolProperty(
         name="自适应面数 / Adapt Quads",
         default=False,
-        description="让 Quad Remesher 根据模型复杂度自动调整目标面数"
+        description="让 Quad Remesher 根据模型复杂度自动调整目标面数（仅 QR）"
     )  # type: ignore
     timeout_seconds: bpy.props.IntProperty(
         name="超时 / Timeout (s)",
         default=300, min=30, max=3600,
-        description="等待 Quad Remesher 完成的最大时间（秒）"
+        description="等待 Quad Remesher 完成的最大时间（秒）（仅 QR）"
     )  # type: ignore
 
 
@@ -166,8 +175,8 @@ class GLB_BakeProperties(bpy.types.PropertyGroup):
     )  # type: ignore
     cage_extrusion: bpy.props.FloatProperty(
         name="包裹笼挤出 / Cage Extrusion",
-        default=0.1, min=0.0, max=1.0, step=0.01,
-        description="烘焙时 Cage 向外挤出的距离（米）"
+        default=0.2, min=0.0, max=2.0, step=0.01,
+        description="烘焙 Cage 向外挤出距离。如果烘焙结果有黑斑，适当增大此值"
     )  # type: ignore
     bake_normal: bpy.props.BoolProperty(
         name="同时烘焙法线贴图 / Bake Normal Map",
@@ -421,7 +430,96 @@ def do_import():
     if v0 != v1:
         log(f"  额外合并 {v0 - v1} 顶点 / merged vertices")
 
-    # ── 启动 Quad Remesher ──
+    # ── 重拓扑（按选择的方法分支）──
+    method = settings.remesh.remesh_method
+
+    if method == 'NATIVE':
+        _do_native_remesh(high)
+        # 原生重拓扑是同步的，完成后直接进下一阶段
+        STATE.stage = 'uv_mat'
+        update_progress()
+
+    elif method == 'QUADREMESHER':
+        _do_qr_remesh(high)
+        STATE.stage = 'remesh_wait'
+        update_progress()
+
+
+def _do_native_remesh(high):
+    """Blender 原生减面：Decimate Collapse → Tris转Quads（稳定，无破面）"""
+    settings = bpy.context.scene.glb_settings
+    target = settings.remesh.quad_count
+    log("Blender 原生减面重拓扑 / Native decimate remesh")
+    log(f"  目标面数: {target}")
+
+    # 确保在 OBJECT 模式
+    try:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+
+    # 高模改名（保留着给后续烘焙用）
+    high.name = f"{STATE.base}_high"
+    STATE.high_name = high.name
+    hi_verts = len(high.data.vertices)
+    hi_faces = len(high.data.polygons)
+
+    # ── 步骤 1：复制高模 → 对副本做减面 ──
+    bpy.ops.object.select_all(action='DESELECT')
+    high.select_set(True)
+    bpy.context.view_layer.objects.active = high
+    bpy.ops.object.duplicate()
+    low = bpy.context.active_object
+
+    # ── 步骤 2：Decimate Collapse 减面 ──
+    # 计算减面比例（Collapse 模式的 ratio 是保留比例）
+    ratio = target / hi_faces
+    ratio = max(ratio, 0.001)  # 不少于 0.1%
+    log(f"  减面比例: {ratio:.4f} ({hi_faces} → ~{target})")
+
+    mod = low.modifiers.new(name="DecimateRemesh", type='DECIMATE')
+    mod.decimate_type = 'COLLAPSE'
+    mod.ratio = ratio
+    mod.use_symmetry = False
+
+    bpy.ops.object.select_all(action='DESELECT')
+    low.select_set(True)
+    bpy.context.view_layer.objects.active = low
+    bpy.ops.object.modifier_apply(modifier="DecimateRemesh")
+    log(f"  减面后: {len(low.data.polygons)} 面")
+
+    # ── 步骤 3：清理 + Tris → Quads ──
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    # 去除重叠顶点
+    try:
+        bpy.ops.mesh.remove_doubles(threshold=0.0001)
+    except Exception:
+        bpy.ops.mesh.merge_by_distance(threshold=0.0001)
+    # 统一法线
+    try:
+        bpy.ops.mesh.normals_make_consistent(inside=False)
+    except Exception:
+        pass
+    # 三角面 → 四边面
+    try:
+        bpy.ops.mesh.tris_convert_to_quads()
+    except Exception:
+        pass
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+    low.name = f"{STATE.base}_low"
+    STATE.low_name = low.name
+    log(f"  低模: {low.name} ({len(low.data.vertices)} 顶点, {len(low.data.polygons)} 面)")
+    log(f"  高模保留: {high.name} ({hi_verts} 顶点) — 用于后续烘焙")
+
+
+# _voxel_remesh_fallback 已移除 — 不再使用体素重拓扑
+
+
+def _do_qr_remesh(high):
+    """启动 Quad Remesher 外部引擎（异步，需付费）"""
+    settings = bpy.context.scene.glb_settings
     log("启动 Quad Remesher...")
     qr = bpy.context.scene.qremesher
     qr.target_count = settings.remesh.quad_count
@@ -437,9 +535,6 @@ def do_import():
     bpy.context.view_layer.objects.active = high
     bpy.ops.qremesher.remesh()
     log("  外部引擎已启动，等待重拓扑完成... / External engine started, waiting...")
-
-    STATE.stage = 'remesh_wait'
-    update_progress()
 
 
 def do_remesh_wait():
@@ -985,14 +1080,17 @@ class GLB_OT_BatchProcess(bpy.types.Operator):
             self.report({'ERROR'}, "请选择有效的输入文件夹 / Invalid input folder")
             return {'CANCELLED'}
 
-        # 校验 Quad Remesher — 直接检测操作符是否存在（比查addon名更可靠）
-        if not hasattr(bpy.ops.qremesher, 'remesh'):
-            self.report({'ERROR'}, "请先安装并启用 Quad Remesher 插件！")
-            popup("未检测到 Quad Remesher 插件!\n"
-                  "请先安装: https://exoside.com/quadremesher/\n"
-                  "Quad Remesher add-on not found!",
-                  "错误 / Error", 'ERROR')
-            return {'CANCELLED'}
+        # 如果选了 Quad Remesher 方式，校验操作符是否存在
+        if settings.remesh.remesh_method == 'QUADREMESHER':
+            if not hasattr(bpy.ops.qremesher, 'remesh'):
+                self.report({'ERROR'}, "请先安装并启用 Quad Remesher 插件！或切换到「Blender 原生」方式")
+                popup("未检测到 Quad Remesher 插件!\n\n"
+                      "解决方案:\n"
+                      "  1. 安装 Quad Remesher → https://exoside.com/quadremesher/\n"
+                      "  2. 或在面板中将重拓扑方式切换为「Blender 原生 Quadriflow（免费）」\n"
+                      "Quad Remesher add-on not found!",
+                      "错误 / Error", 'ERROR')
+                return {'CANCELLED'}
 
         # 收集文件
         files = sorted(set(
@@ -1073,10 +1171,11 @@ class GLB_OT_SingleProcess(bpy.types.Operator):
         global _log_path
         settings = context.scene.glb_settings
 
-        # 校验 Quad Remesher — 直接检测操作符是否存在
-        if not hasattr(bpy.ops.qremesher, 'remesh'):
-            self.report({'ERROR'}, "请先安装并启用 Quad Remesher 插件！")
-            return {'CANCELLED'}
+        # 如果选了 Quad Remesher 方式，校验操作符是否存在
+        if settings.remesh.remesh_method == 'QUADREMESHER':
+            if not hasattr(bpy.ops.qremesher, 'remesh'):
+                self.report({'ERROR'}, "请先安装并启用 Quad Remesher 插件！或切换到「Blender 原生」方式")
+                return {'CANCELLED'}
 
         fp = self.filepath
         if not fp or not os.path.isfile(fp):
@@ -1176,9 +1275,14 @@ class GLB_PT_MainPanel(bpy.types.Panel):
         box_remesh = layout.box()
         row = box_remesh.row()
         row.label(text="🔧 重拓扑设置 / Remesh", icon='MOD_REMESH')
+        box_remesh.prop(settings.remesh, "remesh_method")
         box_remesh.prop(settings.remesh, "quad_count")
-        box_remesh.prop(settings.remesh, "adapt_quad_count")
-        box_remesh.prop(settings.remesh, "timeout_seconds")
+
+        is_qr = settings.remesh.remesh_method == 'QUADREMESHER'
+
+        if is_qr:
+            box_remesh.prop(settings.remesh, "adapt_quad_count")
+            box_remesh.prop(settings.remesh, "timeout_seconds")
 
         # ── 🎨 烘焙 ──
         box_bake = layout.box()
@@ -1231,10 +1335,10 @@ class GLB_PT_MainPanel(bpy.types.Panel):
         box_about = layout.box()
         row = box_about.row()
         row.label(text="ℹ 关于 / About", icon='INFO')
-        box_about.label(text="GLB 批量处理 v1.0.0")
-        box_about.label(text="依赖: Quad Remesher 1.23+")
+        box_about.label(text="GLB 批量处理 v1.1.0")
+        box_about.label(text="重拓扑: Blender 原生（免费）/ Quad Remesher（需付费）")
         box_about.label(text="需要: Blender 4.0+")
-        box_about.label(text="GitHub: glb-batch-processor")
+        box_about.label(text="GitHub: Lambda021219/glb-batch-processor")
 
 
 # ============================================================
