@@ -19,3 +19,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Personal / Draft files
+*推广*
+*文案*
